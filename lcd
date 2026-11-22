@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""lcd: front end for the RTX 3090 AORUS XTREME LCD (Edge View).
+
+Renders with Pillow, builds the panel container with aorus_lcd.py's pure functions, and
+pipes it to `aorus-lcd upload --kind ... -` on the machine that owns the GPU.
+
+AORUS_LCD_REMOTE selects where aorus-lcd runs:
+  unset/empty            run locally (needs root for /dev/i2c-N)
+  "ssh root@gpu-host"    run over SSH (any command prefix that executes its arguments)
+
+Only fixed words and validated numbers are placed on the remote command line (ssh hands
+it to a shell); user text, file names and colours only travel as rendered pixels on stdin.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps, ImageSequence
+
+ROOT = Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader('aorus_lcd', str(ROOT / 'aorus_lcd.py'))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+A = importlib.util.module_from_spec(_spec)
+_loader.exec_module(A)
+
+W, H = A.W, A.H
+PREFIX = shlex.split(os.environ.get('AORUS_LCD_REMOTE', ''))
+REMOTE = 'aorus-lcd'
+INSTALL_PATH = '/usr/local/sbin/aorus-lcd'
+PASSTHROUGH = ('status', 'on', 'off', 'mode', 'overlay', 'loop', 'save', 'feed')
+SAFE_WORDS = set(PASSTHROUGH) | set(A.MODE_NAMES) | set(A.WIDGETS) | {
+    'none', '--json', '--interval', '--once'}
+NOTO_DIR = Path('/usr/share/fonts/opentype/noto')
+DEJAVU = Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
+MARGIN = 8
+
+
+class LcdUsage(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- rendering (pure, Pillow)
+def color(text):
+    try:
+        return ImageColor.getrgb(text)[:3]
+    except ValueError as e:
+        raise LcdUsage(f'bad colour {text!r}') from e
+
+
+def to_rgb565(img):
+    img = img.convert('RGB')
+    if img.size != (W, H):
+        raise ValueError(f'frame must be {W}x{H}, got {img.size}')
+    raw = img.tobytes()
+    out = bytearray(len(raw) // 3 * 2)
+    o = 0
+    for i in range(0, len(raw), 3):
+        v = ((raw[i] >> 3) << 11) | ((raw[i + 1] >> 2) << 5) | (raw[i + 2] >> 3)
+        out[o] = v & 0xFF
+        out[o + 1] = v >> 8
+        o += 2
+    return bytes(out)
+
+
+def flatten(img, bg):
+    img = img.convert('RGBA')
+    base = Image.new('RGBA', img.size, bg + (255,))
+    return Image.alpha_composite(base, img).convert('RGB')
+
+
+def fit(img, mode, bg):
+    img = flatten(ImageOps.exif_transpose(img), bg)
+    if mode == 'cover':
+        return ImageOps.fit(img, (W, H), Image.Resampling.LANCZOS)
+    small = ImageOps.contain(img, (W, H), Image.Resampling.LANCZOS)
+    canvas = Image.new('RGB', (W, H), bg)
+    canvas.paste(small, ((W - small.width) // 2, (H - small.height) // 2))
+    return canvas
+
+
+def find_font(path=None, run=subprocess.run):
+    """Return (font path, ttc index). Prefers Noto CJK (Korean face) then DejaVu."""
+    if path:
+        if not Path(path).is_file():
+            raise LcdUsage(f'font not found: {path}')
+        return path, 0
+    candidates = []
+    try:
+        r = run(['fc-match', '-f', '%{file}', 'Noto Sans CJK KR:style=Bold'],
+                capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and 'CJK' in r.stdout:
+            candidates.append(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    candidates += [str(NOTO_DIR / 'NotoSansCJK-Bold.ttc'), str(NOTO_DIR / 'NotoSansCJK-Regular.ttc')]
+    for c in candidates:
+        if Path(c).is_file():
+            return c, (1 if c.endswith('.ttc') and 'NotoSansCJK' in c else 0)  # index 1 = KR
+    if DEJAVU.is_file():
+        return str(DEJAVU), 0
+    raise LcdUsage('no usable font (install fonts-noto-cjk or pass --font)')
+
+
+def render_text(text, fg=(255, 255, 255), bg=(0, 0, 0), size=None, font_path=None):
+    text = text.replace('\\n', '\n')
+    path, index = find_font(font_path)
+    img = Image.new('RGB', (W, H), bg)
+    draw = ImageDraw.Draw(img)
+
+    def load(n):
+        return ImageFont.truetype(path, n, index=index)
+
+    def box(font):
+        l, t, r, b = draw.multiline_textbbox((0, 0), text, font=font, align='center', spacing=font.size // 6)
+        return r - l, b - t
+    if size is None:
+        lo, hi = 6, 160
+        while lo < hi:                           # largest size that fits inside the margins
+            mid = (lo + hi + 1) // 2
+            w, h = box(load(mid))
+            if w <= W - 2 * MARGIN and h <= H - 2 * MARGIN:
+                lo = mid
+            else:
+                hi = mid - 1
+        size = lo
+    font = load(size)
+    draw.multiline_text((W / 2, H / 2), text, font=font, fill=fg, anchor='mm', align='center',
+                        spacing=font.size // 6)
+    return img
+
+
+def gif_frames(img, max_frames, bg):
+    """Return (frames, per-frame delay ms) sampled evenly to at most max_frames."""
+    src = [(fit(f.copy(), 'contain', bg), f.info.get('duration', 100) or 100)
+           for f in ImageSequence.Iterator(img)]
+    if not src:
+        raise LcdUsage('no frames in GIF')
+    step = max(1, -(-len(src) // max_frames))
+    picked = src[::step][:max_frames]
+    delay = round(sum(d for _, d in src) / len(src)) * step
+    return [f for f, _ in picked], delay
+
+
+# ---------------------------------------------------------------- remote calls
+def safe_token(tok):
+    if tok in SAFE_WORDS or re.fullmatch(r'[0-7]|[1-9][0-9]{0,2}', tok):
+        return tok
+    raise LcdUsage(f'argument {tok!r} is not allowed on the remote command line')
+
+
+def remote(args, stdin=None, run=subprocess.run):
+    cmd = PREFIX + [REMOTE] + [safe_token(a) for a in args]
+    return run(cmd, input=stdin).returncode
+
+
+def upload_args(kind, delay_ms=None, save=False):
+    args = ['upload', '--kind', kind]
+    if delay_ms is not None:
+        args += ['--delay-ms', str(int(delay_ms))]
+    if save:
+        args.append('--save')
+    return args + ['-']
+
+
+def remote_upload(kind, blob, delay_ms=None, save=False, run=subprocess.run):
+    cmd = PREFIX + [REMOTE] + upload_args(kind, delay_ms, save)
+    return run(cmd, input=blob).returncode
+
+
+def install(run=subprocess.run):
+    """Install aorus_lcd.py as root 0755 on the GPU machine and run selftest + status."""
+    body = (ROOT / 'aorus_lcd.py').read_bytes()
+    tmp = INSTALL_PATH + '.new'
+    script = (f'set -e; umask 022; cat > {tmp}; chown root:root {tmp}; chmod 0755 {tmp}; '
+              f'mv -f {tmp} {INSTALL_PATH}; {INSTALL_PATH} selftest; {INSTALL_PATH} status')
+    return run((PREFIX + [script]) if PREFIX else ['sh', '-c', script], input=body).returncode
+
+
+# ---------------------------------------------------------------- CLI
+def build_parser():
+    p = argparse.ArgumentParser(prog='lcd', description='RTX 3090 AORUS XTREME LCD (320x170) front end.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    def common(s):
+        s.add_argument('--preview', metavar='PNG', help='save what will be uploaded as PNG')
+        s.add_argument('--container', metavar='BIN', help='save the panel container')
+        s.add_argument('--dry-run', action='store_true', help='render only; do not touch the panel')
+        s.add_argument('--save', action='store_true', help='also persist panel settings (AA)')
+    s = sub.add_parser('image')
+    s.add_argument('file')
+    s.add_argument('--fit', choices=('cover', 'contain'), default='cover')
+    s.add_argument('--bg', default='black')
+    common(s)
+    s = sub.add_parser('text')
+    s.add_argument('text')
+    s.add_argument('--color', default='white')
+    s.add_argument('--bg', default='black')
+    s.add_argument('--size', type=int)
+    s.add_argument('--font')
+    common(s)
+    s = sub.add_parser('gif')
+    s.add_argument('file')
+    s.add_argument('--max-frames', type=int, default=60)
+    s.add_argument('--delay-ms', type=int)
+    s.add_argument('--bg', default='black')
+    common(s)
+    sub.add_parser('install', help='install aorus-lcd on the GPU machine')
+    for name in PASSTHROUGH:
+        s = sub.add_parser(name, help=f'aorus-lcd {name} on the GPU machine')
+        s.add_argument('rest', nargs=argparse.REMAINDER)
+    return p
+
+
+def render(args):
+    """Return (kind, container, preview frames, delay_ms or None)."""
+    if args.cmd == 'image':
+        with Image.open(args.file) as im:
+            frame = fit(im, args.fit, color(args.bg))
+        return 'image', A.build_image_container(to_rgb565(frame)), [frame], None
+    if args.cmd == 'text':
+        frame = render_text(args.text, color(args.color), color(args.bg), args.size, args.font)
+        return 'image', A.build_image_container(to_rgb565(frame)), [frame], None
+    if not 1 <= args.max_frames <= A.GIF_MAX_FRAMES:
+        raise LcdUsage(f'--max-frames must be 1..{A.GIF_MAX_FRAMES}')
+    with Image.open(args.file) as im:
+        frames, delay = gif_frames(im, args.max_frames, color(args.bg))
+    delay = args.delay_ms if args.delay_ms is not None else delay
+    if not 1 <= delay <= 255:
+        print(f'lcd: frame delay {delay} ms clamped to 1..255 (one-byte firmware field)', file=sys.stderr)
+        delay = max(1, min(255, delay))
+    blob = A.build_gif_container([to_rgb565(f) for f in frames])
+    if len(blob) > A.GIF_MAX_BYTES:
+        raise LcdUsage(f'GIF container {len(blob)} bytes > {A.GIF_MAX_BYTES}; use fewer --max-frames')
+    return 'gif', blob, frames, delay
+
+
+def main(argv=None, run=subprocess.run):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in PASSTHROUGH:          # forwarded verbatim after token whitelisting
+        try:
+            return remote(argv, run=run)
+        except LcdUsage as e:
+            print(f'lcd: {e}', file=sys.stderr)
+            return 1
+    args = build_parser().parse_args(argv)
+    try:
+        if args.cmd == 'install':
+            return install(run=run)
+        kind, blob, frames, delay = render(args)
+        A.validate_upload(kind, blob)
+        if args.preview:
+            if len(frames) > 1:
+                frames[0].save(args.preview, format='PNG', save_all=True,
+                               append_images=frames[1:], duration=delay, loop=0)
+            else:
+                frames[0].save(args.preview, format='PNG')
+        if args.container:
+            Path(args.container).write_bytes(blob)
+        print(f'lcd: {kind} container {len(blob)} bytes, {len(frames)} frame(s), head {blob[:12].hex(" ")}',
+              file=sys.stderr)
+        if args.dry_run:
+            return 0
+        return remote_upload(kind, blob, delay, args.save, run=run)
+    except (LcdUsage, A.LcdError, OSError) as e:
+        print(f'lcd: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
